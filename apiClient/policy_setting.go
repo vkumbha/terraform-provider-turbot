@@ -179,13 +179,19 @@ func (client *Client) FindPolicySetting(policyTypeUri, resourceAka string) (Poli
 		// than a denial of the list itself — see ReadPolicySetting. Retry without the secret
 		// fields; if that fails too, surface the original error.
 		//
-		// Unlike the read, this path does NOT refuse a secret policy type. The caller
-		// (resourceTurbotPolicySettingCreate) uses the result only to detect that a setting
-		// already exists, and gates on Value != nil. For a secret type the plain field carries
-		// the secret REFERENCE {"secret": {"id": "..."}} rather than the value — non-nil, so an
-		// existing secret setting is still detected as existing. Nothing here is stored in state,
-		// so the reference is never written anywhere; it only has to be distinguishable from
-		// absent, and it is.
+		// Unlike the read, this path does NOT refuse a secret policy type: nothing it returns
+		// reaches Terraform state, so there is no value to protect. It only has to decode, which
+		// is why the tolerant response type is needed — for a secret type both plain fields carry
+		// the secret reference {"secret": {"id": "..."}}, an object, and PolicySetting.ValueSource
+		// is a string.
+		//
+		// Note this lookup cannot currently report "already exists" whatever it returns: neither
+		// find query selects `default`, so the selection below never fires and the caller's
+		// Value != nil check never sees a value. That is a pre-existing defect of the selection —
+		// the primary path behaves identically — and it is not load-bearing for safety here.
+		// Guardrails refuses a duplicate create server-side with a conflict, and refuses the
+		// create outright for an identity without Turbot/Admin, so neither can overwrite an
+		// existing setting (both verified live).
 		fallbackData := &findPolicySettingWithoutSecretsResponse{}
 		if fallbackErr := client.doRequest(findPolicySettingWithoutSecretsQuery(), variables, fallbackData); fallbackErr == nil {
 			return fallbackData.firstDefault(), nil

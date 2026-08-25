@@ -275,44 +275,60 @@ func TestReadPolicySettingSingleCallOnSuccess(t *testing.T) {
 	assert.Len(t, stub.requests, 1, "no fallback call when the primary read succeeds")
 }
 
-// FindPolicySetting feeds duplicate detection in Create. A Forbidden caused by the secretValue
-// guard on a matched item must fall back rather than fail, so Create can produce its correct
-// "already exists, import it" error instead of a bare Forbidden.
+// NOTE ON THESE FIXTURES: neither find query selects `default`, so a real response never carries
+// that key and the items decode with Default == false. Fixtures here omit it to match, which means
+// FindPolicySetting's `if Default` selection never fires and the result is an empty PolicySetting.
+// That is a pre-existing defect in the selection (tracked separately), NOT something this fallback
+// introduces or can fix: the primary path behaves identically. What these tests pin is the part
+// that is this change's responsibility — that a Forbidden retries without the secret fields, and
+// that the retry decodes.
+
+// A Forbidden caused by the secretValue guard on a matched item must retry without those fields
+// rather than failing the whole find.
 func TestFindPolicySettingFallsBackOnForbidden(t *testing.T) {
 	stub := &graphqlStub{
 		forbidden: true,
 		fallbackBody: `{"data":{"policySettings":{"items":[{
-			"value":"Check: Enabled","valueSource":"Check: Enabled","precedence":"REQUIRED","default":true,
+			"value":"Check: Enabled","valueSource":"Check: Enabled","precedence":"REQUIRED",
 			"turbot":{"id":"394355651429758"}}]}}}`,
 	}
 	client := stubClient(t, stub)
 
-	setting, err := client.FindPolicySetting("tmod:@turbot/aws-s3#/policy/types/s3AccountPublicAccessBlock", "394355648135523")
+	_, err := client.FindPolicySetting("tmod:@turbot/aws-s3#/policy/types/s3AccountPublicAccessBlock", "394355648135523")
 
-	assert.NoError(t, err)
-	assert.Equal(t, "394355651429758", setting.Turbot.Id)
+	assert.NoError(t, err, "the Forbidden must be retried, not surfaced")
 	assert.Len(t, stub.requests, 2)
 	assert.NotContains(t, stub.requests[1], "secretValue")
 }
 
-// Unlike the read, the find path must NOT refuse a secret type — it only answers "does a setting
-// already exist". For a secret type the plain fields carry the secret reference, an object: it
-// must decode (PolicySetting.ValueSource is a string, so the tolerant type is required) and Value
-// must come back non-nil, because the caller's existence check is `Value != nil`. If this returned
-// a nil Value, Create would conclude no setting exists and proceed against one that does.
-func TestFindPolicySettingDetectsExistingSecretSetting(t *testing.T) {
+// Unlike the read, the find path must not refuse a secret type — it only answers "does a setting
+// already exist", and nothing it returns reaches Terraform state. What it must do is DECODE: for a
+// secret type both plain fields carry the secret reference, an object, and PolicySetting.ValueSource
+// is a string, so without the tolerant type the retry dies with "cannot unmarshal object into Go
+// struct field" — trading one opaque failure for another.
+func TestFindPolicySettingDecodesSecretReference(t *testing.T) {
 	const secretRef = `{"secret":{"id":"387519256421702"}}`
 	stub := &graphqlStub{
 		forbidden: true,
 		fallbackBody: `{"data":{"policySettings":{"items":[{
-			"value":` + secretRef + `,"valueSource":` + secretRef + `,"precedence":"REQUIRED","default":true,
+			"value":` + secretRef + `,"valueSource":` + secretRef + `,"precedence":"REQUIRED",
 			"turbot":{"id":"387519256437064"}}]}}}`,
 	}
 	client := stubClient(t, stub)
 
-	setting, err := client.FindPolicySetting("tmod:@turbot/azure#/policy/types/clientKey", "387519252604383")
+	_, err := client.FindPolicySetting("tmod:@turbot/azure#/policy/types/clientKey", "387519252604383")
 
 	assert.NoError(t, err, "an object-shaped value must decode, not fail with a JSON error")
-	assert.NotNil(t, setting.Value, "an existing secret setting must read as existing")
-	assert.Equal(t, "387519256437064", setting.Turbot.Id)
+	assert.Len(t, stub.requests, 2)
+}
+
+// Guard against the fixture mistake that made an earlier version of these tests assert a fiction:
+// they passed "default":true, which the queries never request, so they "proved" a selection that
+// cannot happen live. Assert the queries and the decode target agree — if `default` is ever added
+// to the selection, this fails and the tests above get revisited deliberately.
+func TestFindQueriesDoNotSelectDefault(t *testing.T) {
+	assert.NotContains(t, findPolicySettingQuery(), "default",
+		"if default becomes selected, FindPolicySetting's selection starts firing - revisit the find tests")
+	assert.NotContains(t, findPolicySettingWithoutSecretsQuery(), "default",
+		"the fallback must match the primary query's selection, or the two paths diverge")
 }
